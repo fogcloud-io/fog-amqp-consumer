@@ -25,11 +25,25 @@ var (
 
 	defaultAMQPClient *RabbitmqClient
 	onceAmqp          sync.Once
+
+	ErrConnTimeout = errors.New("amqp connect timeout")
 )
 
-func getAMQPURLFromEnv(host, port, key, secret string) string {
+type Option func(*RabbitmqClient)
+
+func OptTLS(tls bool) Option {
+	return func(rc *RabbitmqClient) {
+		rc.tls = tls
+	}
+}
+
+func getAMQPURLFromEnv(host, port, key, secret string, tls bool) string {
 	u, p := getAMQPAccess(key, secret)
-	return fmt.Sprintf("amqp://%s:%s@%s:%s", u, p, host, port)
+	protocol := "amqp"
+	if tls {
+		protocol = "amqps"
+	}
+	return fmt.Sprintf("%s://%s:%s@%s:%s", protocol, u, p, host, port)
 }
 
 func getAMQPAccess(key, secret string) (username, password string) {
@@ -64,15 +78,19 @@ func authAMQPSign(clientId, accessKey, timestamp, accessSecret, signMethod strin
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func InitAMQPConsumer(ctx context.Context, host, port, key, secret string) *RabbitmqClient {
+func InitAMQPConsumer(ctx context.Context, host, port, key, secret string, opts ...Option) *RabbitmqClient {
 	onceAmqp.Do(func() {
 		reconnCtx, cancel := context.WithCancel(ctx)
 		defaultAMQPClient = &RabbitmqClient{
-			url:          getAMQPURLFromEnv(host, port, key, secret),
 			cancelReconn: cancel,
 			reconnCtx:    reconnCtx,
 			closeCh:      make(chan struct{}),
 		}
+		for _, opt := range opts {
+			opt(defaultAMQPClient)
+		}
+
+		defaultAMQPClient.initURI(host, port, key, secret)
 		log.Println("amqp connecting")
 		err := defaultAMQPClient.initConn()
 		if err != nil {
@@ -84,6 +102,7 @@ func InitAMQPConsumer(ctx context.Context, host, port, key, secret string) *Rabb
 }
 
 type RabbitmqClient struct {
+	tls           bool
 	url           string
 	accessKey     string
 	conn          *amqp.Connection
@@ -106,6 +125,10 @@ func (rc *RabbitmqClient) initConn() (err error) {
 	return
 }
 
+func (rc *RabbitmqClient) initURI(host, port, key, secret string) {
+	rc.url = getAMQPURLFromEnv(host, port, key, secret, rc.tls)
+}
+
 func (rc *RabbitmqClient) reConn() error {
 	var err error
 	rc.mu.Lock()
@@ -116,14 +139,22 @@ func (rc *RabbitmqClient) reConn() error {
 	}
 	rc.reconnCtx, rc.cancelReconn = context.WithCancel(context.Background())
 	rc.mu.Unlock()
+	maxPause := 20 * time.Second
+	pause := 1 * time.Second
 	for {
 		if rc.conn == nil || rc.conn.IsClosed() {
 			log.Printf("amqp %dth reconnecting ...", rc.currReConnNum+1)
 			err = rc.initConn()
 			if err != nil {
-				rc.currReConnNum++
-				time.Sleep(time.Second * 10)
-				continue
+				if pause < maxPause {
+					rc.currReConnNum++
+					log.Printf("amqp reconnecting after %s", pause)
+					time.Sleep(pause)
+					pause *= 2
+					continue
+				} else {
+					return ErrConnTimeout
+				}
 			}
 		}
 		rc.currReConnNum = 0
@@ -162,7 +193,7 @@ func (rc *RabbitmqClient) getClientid() string {
 	return clientId + "-" + generateUUID(8)
 }
 
-func (rc *RabbitmqClient) ConsumeWithHanlder(ctx context.Context, handler func([]byte)) {
+func (rc *RabbitmqClient) ConsumeWithHandler(ctx context.Context, handler func([]byte)) {
 	ch, err := rc.Consume(100, rc.accessKey, rc.getClientid())
 	if err != nil {
 		log.Printf("Consume: %s", err)
@@ -177,7 +208,7 @@ func (rc *RabbitmqClient) ConsumeWithHanlder(ctx context.Context, handler func([
 	case <-ctx.Done():
 		return
 	default:
-		go rc.ConsumeWithHanlder(ctx, handler)
+		go rc.ConsumeWithHandler(ctx, handler)
 	}
 }
 
