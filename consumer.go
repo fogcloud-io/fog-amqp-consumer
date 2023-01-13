@@ -1,7 +1,6 @@
 package consumer
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha1"
@@ -9,36 +8,62 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"log"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 )
+
+type Logger interface {
+	Debug(args ...interface{})
+	Debugf(template string, args ...interface{})
+	Info(args ...interface{})
+	Infof(template string, args ...interface{})
+	Warn(args ...interface{})
+	Warnf(template string, args ...interface{})
+	Fatal(args ...interface{})
+	Fatalf(template string, args ...interface{})
+}
+
+type Delivery = amqp.Delivery
 
 var (
-	clientId = "faas"
-
-	defaultAMQPClient *RabbitmqClient
-	onceAmqp          sync.Once
-
-	ErrConnTimeout = errors.New("amqp connect timeout")
+	ErrAmqpShutdown           = errors.New("amqp shutdown")
+	ErrAmqpChannelInitTimeout = errors.New("amqp channel init timeout")
+	ErrAmqpConnTimeout        = errors.New("amqp connect timeout")
+	ErrAmqpConnNil            = errors.New("amqp conn nil")
+	ErrAmqpReconn             = errors.New("amqp reconnecting")
 )
 
-type Option func(*RabbitmqClient)
+type ClientOption func(*RabbitmqClient)
 
-func OptTLS(tls bool) Option {
+type AMQPMsgHandler = func(amqp.Delivery)
+
+func WithClientOptionsLogger(logger Logger) ClientOption {
 	return func(rc *RabbitmqClient) {
-		rc.tls = tls
+		if logger != nil {
+			rc.logger = logger
+		}
 	}
 }
 
-func getAMQPURLFromEnv(host, port, key, secret string, tls bool) string {
-	u, p := getAMQPAccess(key, secret)
+func WithClientOptionsConnTimeout(t time.Duration) ClientOption {
+	return func(rc *RabbitmqClient) {
+		rc.connTimeout = t
+	}
+}
+
+func WithClientOptionsChInitTimeout(t time.Duration) ClientOption {
+	return func(rc *RabbitmqClient) {
+		rc.initMQChTimeout = t
+	}
+}
+
+func parseAMQPURL(host, port, key, secret, clientID string, tls bool) string {
+	u, p := getAMQPAccess(key, secret, clientID)
 	protocol := "amqp"
 	if tls {
 		protocol = "amqps"
@@ -46,10 +71,10 @@ func getAMQPURLFromEnv(host, port, key, secret string, tls bool) string {
 	return fmt.Sprintf("%s://%s:%s@%s:%s", protocol, u, p, host, port)
 }
 
-func getAMQPAccess(key, secret string) (username, password string) {
+func getAMQPAccess(key, secret, clientID string) (username, password string) {
 	timestamp := strconv.Itoa(int(time.Now().Unix()))
-	sign, _ := authAMQPSign(clientId, key, timestamp, secret, "hmacsha1")
-	username = fmt.Sprintf("%s&%s&%s", clientId, key, timestamp)
+	sign, _ := authAMQPSign(clientID, key, timestamp, secret, "hmacsha1")
+	username = fmt.Sprintf("%s&%s&%s", clientID, key, timestamp)
 	password = sign
 	return
 }
@@ -78,145 +103,267 @@ func authAMQPSign(clientId, accessKey, timestamp, accessSecret, signMethod strin
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func InitAMQPConsumer(ctx context.Context, host, port, key, secret string, opts ...Option) *RabbitmqClient {
-	onceAmqp.Do(func() {
-		reconnCtx, cancel := context.WithCancel(ctx)
-		defaultAMQPClient = &RabbitmqClient{
-			cancelReconn: cancel,
-			reconnCtx:    reconnCtx,
-			closeCh:      make(chan struct{}),
-		}
-		for _, opt := range opts {
-			opt(defaultAMQPClient)
-		}
+func NewFogConsumerClient(host, port, accessKey, accessSecret, clientID string, tls bool, opts ...ClientOption) (*RabbitmqClient, error) {
+	uri := parseAMQPURL(host, port, accessKey, accessSecret, clientID, tls)
+	return NewRabbitmqCli(uri, opts...)
+}
 
-		defaultAMQPClient.initURI(host, port, key, secret)
-		log.Println("amqp connecting")
-		err := defaultAMQPClient.initConn()
-		if err != nil {
-			log.Fatalf("amqp init error: %s", err)
-		}
-	})
-	log.Println("amqp connected")
-	return defaultAMQPClient
+func NewRabbitmqCli(endpoint string, opts ...ClientOption) (*RabbitmqClient, error) {
+	l, _ := zap.NewProduction()
+	cli := &RabbitmqClient{
+		url:             endpoint,
+		done:            make(chan bool, 1),
+		reconnDone:      make(chan struct{}, 1),
+		connTimeout:     time.Second * 30,
+		initMQChTimeout: time.Second * 30,
+		logger:          l.Sugar(),
+	}
+
+	for _, opt := range opts {
+		opt(cli)
+	}
+
+	err := cli.handleReConnSync()
+	if err != nil {
+		return nil, err
+	}
+	return cli, nil
 }
 
 type RabbitmqClient struct {
-	tls           bool
-	url           string
-	accessKey     string
-	conn          *amqp.Connection
-	mqCh          *amqp.Channel
-	reConnFlag    uint32
-	currReConnNum int
+	url        string
+	conn       *amqp.Connection
+	mqCh       *amqp.Channel
+	logger     Logger
+	reConnFlag uint32
 
-	mu           sync.Mutex
-	closeCh      chan struct{}
-	cancelReconn context.CancelFunc
-	reconnCtx    context.Context
-}
+	connTimeout     time.Duration
+	initMQChTimeout time.Duration
 
-func (rc *RabbitmqClient) initConn() (err error) {
-	rc.conn, err = amqp.Dial(rc.url)
-	if err != nil {
-		return
-	}
-	rc.mqCh, err = rc.conn.Channel()
-	return
-}
+	mu sync.Mutex
 
-func (rc *RabbitmqClient) initURI(host, port, key, secret string) {
-	rc.url = getAMQPURLFromEnv(host, port, key, secret, rc.tls)
-}
+	notifyConnClose chan *amqp.Error
+	notifyChanClose chan *amqp.Error
+	notifyConfirm   chan amqp.Confirmation
 
-func (rc *RabbitmqClient) reConn() error {
-	var err error
-	rc.mu.Lock()
-	if !atomic.CompareAndSwapUint32(&rc.reConnFlag, 0, 1) {
-		rc.mu.Unlock()
-		<-rc.reconnCtx.Done()
-		return nil
-	}
-	rc.reconnCtx, rc.cancelReconn = context.WithCancel(context.Background())
-	rc.mu.Unlock()
-	maxPause := 20 * time.Second
-	pause := 1 * time.Second
-	for {
-		if rc.conn == nil || rc.conn.IsClosed() {
-			log.Printf("amqp %dth reconnecting ...", rc.currReConnNum+1)
-			err = rc.initConn()
-			if err != nil {
-				if pause < maxPause {
-					rc.currReConnNum++
-					log.Printf("amqp reconnecting after %s", pause)
-					time.Sleep(pause)
-					pause *= 2
-					continue
-				} else {
-					return ErrConnTimeout
-				}
-			}
-		}
-		rc.currReConnNum = 0
-		log.Println("amqp reconnected successfully")
-		atomic.StoreUint32(&rc.reConnFlag, 0)
-		rc.cancelReconn()
-		return nil
-	}
-}
-
-func (rc *RabbitmqClient) Consume(prefetchCnt int, queue, consumerName string) (ch <-chan amqp.Delivery, err error) {
-	err = rc.mqCh.Qos(prefetchCnt, 0, false)
-	if err != nil {
-		err = rc.reConn()
-	}
-	if err != nil {
-		return
-	}
-	ch, err = rc.mqCh.Consume(queue, consumerName, true, false, false, true, amqp.Table{})
-	if err != nil {
-		err = rc.reConn()
-	}
-	return
+	done       chan bool
+	reconnDone chan struct{}
 }
 
 func (rc *RabbitmqClient) Close() error {
-	close(rc.closeCh)
-	if rc.conn != nil {
-		return rc.conn.Close()
-	} else {
-		return nil
+	close(rc.done)
+	if rc.mqCh != nil {
+		rc.mqCh.Close()
 	}
+	if rc.conn != nil {
+		rc.conn.Close()
+	}
+	return nil
 }
 
-func (rc *RabbitmqClient) getClientid() string {
-	return clientId + "-" + generateUUID(8)
-}
-
-func (rc *RabbitmqClient) ConsumeWithHandler(ctx context.Context, handler func([]byte)) {
-	ch, err := rc.Consume(100, rc.accessKey, rc.getClientid())
+func (rc *RabbitmqClient) Consume(prefetchCnt int, queue, consumerName string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (ch <-chan amqp.Delivery, err error) {
+	err = rc.mqCh.Qos(prefetchCnt, 0, false)
 	if err != nil {
-		log.Printf("Consume: %s", err)
+		rc.logger.Debugf("RabbitmqClient.Consume: mqCh.Qos: %s", err)
+		rc.handleReConnSync()
+	}
+	if err != nil {
 		return
 	}
-	log.Println("amqp consuming...")
+	ch, err = rc.mqCh.Consume(queue, consumerName, autoAck, exclusive, noLocal, noWait, args)
+	if err != nil {
+		rc.logger.Debugf("RabbitmqClient.Consume: mqCh.Consume: %s", err)
+		err = rc.handleReConnSync()
+	}
+	return
+}
+
+// ConsumeWithHandler will consume with block until client closed or connect timeout
+func (rc *RabbitmqClient) ConsumeWithHandler(prefetchCnt int, queue, consumerName string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table, handler AMQPMsgHandler) error {
+	ch, err := rc.Consume(prefetchCnt, queue, consumerName, autoAck, exclusive, noLocal, noWait, args)
+	if err != nil {
+		rc.logger.Infof("RabbitmqClient Consume: %s", err)
+		return err
+	}
+	rc.logger.Info("RabbitmqClient consuming...")
 	for msg := range ch {
-		go handler(msg.Body)
+		handler(msg)
 	}
 
 	select {
-	case <-ctx.Done():
-		return
+	case <-rc.done:
+		return ErrAmqpShutdown
 	default:
-		go rc.ConsumeWithHandler(ctx, handler)
+		err = rc.handleReConnSync()
+		if err != nil {
+			return err
+		}
+		return rc.ConsumeWithHandler(prefetchCnt, queue, consumerName, autoAck, exclusive, noLocal, noWait, args, handler)
 	}
 }
 
-func generateUUID(maxLen int) string {
-	raw := strings.ReplaceAll(uuid.NewString(), "-", "")
-	if len(raw) <= maxLen {
-		return raw
+// handleReconnAsync
+func (client *RabbitmqClient) handleReconnAsync() error {
+	// 已开始重连
+	if atomic.LoadUint32(&client.reConnFlag) == 1 {
+		client.logger.Debug("handleReconnAsync reconnecting")
+		return ErrAmqpReconn
 	} else {
-		return raw[:maxLen]
+		go client.handleReConnSync()
+		return ErrAmqpReconn
 	}
+}
+
+// handleReConnSync will block until conn successfully or conn timeout
+func (client *RabbitmqClient) handleReConnSync() error {
+	client.mu.Lock()
+	if !atomic.CompareAndSwapUint32(&client.reConnFlag, 0, 1) {
+		client.logger.Info("RabbitmqClient waiting for reconnecting...")
+		client.mu.Unlock()
+		select {
+		case <-client.reconnDone:
+			return nil
+		case <-client.done:
+			return ErrAmqpShutdown
+		}
+	}
+	client.reconnDone = make(chan struct{}, 1)
+	client.mu.Unlock()
+	err := client.reconnWithBlock()
+	close(client.reconnDone)
+	atomic.StoreUint32(&client.reConnFlag, 0)
+	return err
+}
+
+func (client *RabbitmqClient) reconnWithBlock() error {
+	var err error
+	delay := time.Second
+	client.logger.Info("RabbitmqClient attempt to connect")
+loop:
+	for {
+		conn, err1 := client.makeConn()
+		if err1 != nil {
+			if delay > client.connTimeout {
+				err = ErrAmqpConnTimeout
+				break
+			}
+			select {
+			case <-client.done:
+				err = ErrAmqpShutdown
+				break loop
+			case <-time.After(delay):
+				client.logger.Infof("RabbitmqClient connect error, Retrying after %s...", delay)
+				delay *= 2
+			}
+			continue
+		}
+		client.chgConn(conn)
+
+		if err = client.handleMQChInit(); err != nil {
+			break
+		}
+
+		select {
+		case <-client.done:
+			err = ErrAmqpShutdown
+			break loop
+		case <-client.notifyConnClose:
+			client.logger.Info("RabbitmqClient connection closed. Reconnecting...")
+		default:
+			err = nil
+			break loop
+		}
+	}
+	if err == nil {
+		client.logger.Info("RabbitmqClient connect successfully")
+	} else {
+		client.logger.Infof("RabbitmqClient connect error: %s", err)
+	}
+
+	return err
+}
+
+func (client *RabbitmqClient) handleMQChInit() (err error) {
+	delay := time.Second
+	for {
+		client.logger.Info("RabbitmqClient attempt to init channel")
+		if !client.validateConn() {
+			err = client.handleReConnSync()
+			if err != nil {
+				return err
+			}
+		}
+		ch, err := client.makeMQCh()
+		if err != nil {
+			if delay > client.initMQChTimeout {
+				return ErrAmqpChannelInitTimeout
+			}
+			client.logger.Infof("RabbitmqClient init channel error: %s. Retrying after %s...", err, delay)
+
+			select {
+			case <-client.done:
+				return ErrAmqpShutdown
+			case <-time.After(delay):
+				delay *= 2
+			}
+			continue
+		}
+
+		client.chgMQCh(ch)
+		select {
+		case <-client.done:
+			return ErrAmqpShutdown
+		case <-client.notifyChanClose:
+			client.logger.Info("RabbitmqClient channel closed. Re-running init...")
+		default:
+			return nil
+		}
+	}
+}
+
+func (client *RabbitmqClient) makeConn() (*amqp.Connection, error) {
+	conn, err := amqp.Dial(client.url)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (client *RabbitmqClient) chgConn(conn *amqp.Connection) {
+	client.conn = conn
+	client.notifyConnClose = make(chan *amqp.Error, 1)
+	client.conn.NotifyClose(client.notifyConnClose)
+}
+
+func (client *RabbitmqClient) validateConn() bool {
+	if client.conn != nil && !client.conn.IsClosed() {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (client *RabbitmqClient) makeMQCh() (*amqp.Channel, error) {
+	if client.conn == nil {
+		return nil, ErrAmqpConnNil
+	}
+	ch, err := client.conn.Channel()
+	if err != nil {
+		return nil, err
+	}
+
+	err = ch.Confirm(false)
+	if err != nil {
+		return nil, err
+	}
+
+	return ch, nil
+}
+
+func (client *RabbitmqClient) chgMQCh(channel *amqp.Channel) {
+	client.mqCh = channel
+	client.notifyChanClose = make(chan *amqp.Error, 1)
+	client.notifyConfirm = make(chan amqp.Confirmation, 1)
+	client.mqCh.NotifyClose(client.notifyChanClose)
+	client.mqCh.NotifyPublish(client.notifyConfirm)
 }
