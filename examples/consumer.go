@@ -4,7 +4,7 @@ import (
 	"log"
 
 	consumer "github.com/fogcloud-io/fog-amqp-consumer"
-	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 )
 
 var (
@@ -17,13 +17,20 @@ var (
 )
 
 func main() {
-	cli, err := consumer.NewFogConsumerClient(AMQPHost, AMQPPort, accessKey, accessSecret, clientID, AMQPTLS)
+	l, _ := zap.NewDevelopment()
+	cli, err := consumer.NewFogConsumerClient(AMQPHost, AMQPPort, accessKey, accessSecret, clientID, AMQPTLS, consumer.WithClientOptionsLogger(l.Sugar()))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = cli.ConsumeWithHandler(100, accessKey, "fog-test", false, false, false, false, nil, func(b amqp.Delivery) { log.Printf("amqp receive: %s", b.Body); b.Ack(true) })
-	if err != nil {
-		log.Print(err)
-	}
+	go func() {
+		err = cli.ConsumeWithHandler(100, accessKey, "fog-test", func(b consumer.Delivery) { log.Printf("amqp receive: %s", b.Body); b.Ack(true) })
+		if err != nil {
+			log.Print(err)
+		}
+	}()
+
+	ch := make(chan struct{})
+	<-ch
+
 }
